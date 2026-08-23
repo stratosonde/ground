@@ -304,6 +304,78 @@ def decode_port10_compact(data_base64):
     return result
 
 
+def decode_port20_version(data_base64):
+    """
+    Decode Port 20: Version Report frame (12 bytes, little-endian).
+
+    Wire format per stratosonde/firmware Core/Inc/version_report.h +
+    docs/PayloadFormats.md "PORT 20" (A-005/STAB-11/F-09, #79/#158/#266).
+    Because firmware cannot be updated in flight, the device announces its
+    firmware + wire-format version once at commissioning and once at first
+    flight admission on a dedicated port; the backend maps (fw version) ->
+    expected heartbeat wire layout for every subsequent frame.
+
+    Byte layout (12 bytes):
+      | Off  | Field           | Type      | Description                       |
+      |------|-----------------|-----------|-----------------------------------|
+      | 0    | magic           | uint8     | 0x56 ('V')                        |
+      | 1    | fw major        | uint8     | firmware semantic version         |
+      | 2    | fw minor        | uint8     |                                   |
+      | 3    | fw patch        | uint8     |                                   |
+      | 4    | format version  | uint8     | heartbeat wire version (e.g. 2)   |
+      | 5    | stage           | uint8     | 0x01 commissioning, 0x02 flight   |
+      | 6-9  | mission minutes | uint32 LE | Payload_TimestampMinutesNow basis |
+      | 10-11| CRC16           | uint16 LE | CRC-16/CCITT-FALSE over bytes 0-9 |
+
+    Returns:
+        dict with decoded version info (including crc_valid), or None if the
+        payload is not a valid 12-byte frame with the expected magic byte.
+    """
+    import base64
+
+    VERSION_REPORT_MAGIC = 0x56
+    VERSION_REPORT_LEN = 12
+    STAGES = {0x01: "COMMISSIONING", 0x02: "FLIGHT"}
+
+    try:
+        payload = base64.b64decode(data_base64)
+    except Exception:
+        return None
+
+    if len(payload) != VERSION_REPORT_LEN:
+        print(f"Warning: Port 20 version report should be 12 bytes, got {len(payload)}")
+        return None
+
+    if payload[0] != VERSION_REPORT_MAGIC:
+        print(f"Warning: Port 20 bad magic byte 0x{payload[0]:02X} (expected 0x56)")
+        return None
+
+    result = {}
+    result['magic'] = payload[0]
+    result['fw_major'] = payload[1]
+    result['fw_minor'] = payload[2]
+    result['fw_patch'] = payload[3]
+    result['firmware_version'] = f"{payload[1]}.{payload[2]}.{payload[3]}"
+    result['format_version'] = payload[4]
+    stage_raw = payload[5]
+    result['stage'] = stage_raw
+    result['stage_name'] = STAGES.get(stage_raw, f"UNKNOWN(0x{stage_raw:02X})")
+    result['mission_minutes'] = int.from_bytes(payload[6:10], 'little')
+
+    # CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect, no xorout)
+    # over bytes 0-9, compared against the LE word in bytes 10-11.
+    crc = 0xFFFF
+    for b in payload[0:10]:
+        crc ^= (b << 8)
+        for _ in range(8):
+            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
+    wire_crc = int.from_bytes(payload[10:12], 'little')
+    result['crc16'] = wire_crc
+    result['crc_valid'] = (crc == wire_crc)
+
+    return result
+
+
 def decode_port11_bulk(data_base64):
     """
     Decode Port 11: Bulk Binary Packet (up to 222 bytes)
@@ -613,8 +685,59 @@ async def chirpstack_webhook(request: Request):
         port10_data = None
         port11_data = None
         
+        # Port 20: Version Report frame (A-005/#79) - firmware/wire version announce
+        if f_port == 20:
+            data_base64 = payload.get("data", None)
+            version_info = decode_port20_version(data_base64) if data_base64 else None
+            if version_info:
+                print("\n--- PORT 20 VERSION REPORT ---")
+                print(f"Firmware version: {version_info['firmware_version']}")
+                print(f"Heartbeat format version: {version_info['format_version']}")
+                print(f"Stage: {version_info['stage_name']}")
+                print(f"Mission minutes: {version_info['mission_minutes']}")
+                print(f"CRC valid: {version_info['crc_valid']}")
+                print("------------------------------\n")
+
+                # Persist the latest version report per device (not a telemetry point)
+                version_record = {
+                    "timestamp": payload.get("time", timestamp),
+                    "device_name": device_name,
+                    "dev_eui": dev_eui,
+                    "firmware_version": version_info['firmware_version'],
+                    "fw_major": version_info['fw_major'],
+                    "fw_minor": version_info['fw_minor'],
+                    "fw_patch": version_info['fw_patch'],
+                    "format_version": version_info['format_version'],
+                    "stage": version_info['stage'],
+                    "stage_name": version_info['stage_name'],
+                    "mission_minutes": version_info['mission_minutes'],
+                    "crc16": version_info['crc16'],
+                    "crc_valid": version_info['crc_valid'],
+                    "fcnt": payload.get("fCnt", None),
+                    "rssi": gateways[0].get("rssi", None) if gateways else None,
+                    "snr": gateways[0].get("snr", None) if gateways else None,
+                }
+                version_file = os.path.join(DATA_DIR, f"device_version_{dev_eui}.json")
+                with open(version_file, 'w') as f:
+                    json.dump(version_record, f, indent=2)
+                print(f"Saved version report to {version_file}")
+                print(f"{'='*60}\n")
+
+            # Version reports are not telemetry points - do not fall through to save
+            return {
+                "status": "success" if version_info else "warning",
+                "message": "Version report received"
+                           if version_info else "Invalid Port 20 version frame",
+                "timestamp": timestamp,
+                "device": device_name,
+                "dev_eui": dev_eui,
+                "firmware_version": version_info['firmware_version'] if version_info else None,
+                "format_version": version_info['format_version'] if version_info else None,
+                "crc_valid": version_info['crc_valid'] if version_info else None,
+            }
+
         # Port 10: Compact Binary Packet
-        if f_port == 10:
+        elif f_port == 10:
             data_base64 = payload.get("data", None)
             if data_base64:
                 port10_data = decode_port10_compact(data_base64)
@@ -925,6 +1048,19 @@ async def get_latest(dev_eui: str):
     if telemetry_data:
         return telemetry_data[-1]
     return {"message": "No data available"}
+
+
+@app.get("/api/version")
+async def get_version(dev_eui: str):
+    """
+    Get the most recent Port 20 version report for a specific device
+    (firmware version + heartbeat wire-format version).
+    """
+    version_file = os.path.join(DATA_DIR, f"device_version_{dev_eui}.json")
+    if os.path.exists(version_file):
+        with open(version_file, 'r') as f:
+            return json.load(f)
+    return {"message": "No version report available"}
 
 
 @app.get("/health")

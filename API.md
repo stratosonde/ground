@@ -70,6 +70,25 @@ points.
 
 Returns a JSON array of records (schema below).
 
+### `GET /api/version?dev_eui=<eui>`
+Most recent **Port 20 version report** for one device — the firmware and
+heartbeat wire-format version the device announced (A-005/#79). Small payload.
+Returns `{"message": "No version report available"}` if the device has not sent
+a version frame yet. Example response:
+```json
+{
+  "device_name": "strato3",
+  "dev_eui": "6081f95325100915",
+  "firmware_version": "1.0.0",
+  "format_version": 2,
+  "stage_name": "COMMISSIONING",
+  "mission_minutes": 1234,
+  "crc_valid": true
+}
+```
+`format_version` is the heartbeat wire version the backend should expect for
+that device's Port 10 frames; `crc_valid` reports the CRC-16/CCITT check.
+
 ### `GET /` and `GET /viewer`
 `/` returns a status object. `/viewer` serves the CesiumJS 3D map (HTML, not for
 programmatic use).
