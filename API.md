@@ -151,6 +151,15 @@ Each entry in `gateways`:
 | `region` | string | e.g. `US915` |
 | `h3_index` | string | H3 cell of the gateway |
 
+### Packet types feeding telemetry
+Telemetry points carry an `f_port` indicating the source LoRaWAN packet:
+- **`f_port: 10`** — the 11-byte compact heartbeat (SF10, low-res, current
+  position/sensors).
+- **`f_port: 11`** — high-resolution archive records (bulk v6, SF7 backfill).
+  These carry `bulk_sequence`, `sensor_quality`, `veto_reason`, and
+  `crc16_valid`. Port 10 and Port 11 measurements of the same air should agree
+  (e.g. pressure); both are decoded little-endian per the firmware v6 wire spec.
+
 ### GPS fallback note
 When the radiosonde GPS reports `0.0, 0.0` (not yet locked), the system may use
 the strongest-signal gateway's location as an approximate position. Once the GPS

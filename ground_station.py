@@ -376,164 +376,143 @@ def decode_port20_version(data_base64):
     return result
 
 
+def _crc16_modbus(data):
+    """CRC-16/MODBUS (poly 0xA001 reflected, init 0xFFFF) - matches firmware
+    CalculateCRC16 in payload_encode.c (per-record integrity)."""
+    crc = 0xFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if (crc & 1) else crc >> 1
+    return crc
+
+
+def _crc32_ieee(data):
+    """CRC-32/ISO-HDLC (poly 0xEDB88320 reflected, init/xorout 0xFFFFFFFF) -
+    matches firmware CalculateCRC32 in payload_encode.c (whole-packet trailer)."""
+    crc = 0xFFFFFFFF
+    for b in data:
+        crc ^= b
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xEDB88320 if (crc & 1) else crc >> 1
+    return (~crc) & 0xFFFFFFFF
+
+
 def decode_port11_bulk(data_base64):
     """
-    Decode Port 11: Bulk Binary Packet (up to 222 bytes)
-    
-    High-resolution historical data transfer at SF7:
-    - Header: 6 bytes (packet type, record count, flash address)
-    - Records: Up to 6 × 32-byte high-resolution records
-    - Metadata: 24 bytes (voltage trend, mode history, CRC32)
-    
-    Each 32-byte record includes:
-    - Timestamp: uint32 BE (4 bytes) - second resolution
-    - Latitude: int32 BE (4 bytes) - full precision (~1cm)
-    - Longitude: int32 BE (4 bytes) - full precision (~1cm)
-    - Altitude: int16 BE (2 bytes) - 1m resolution
-    - Temperature: int16 BE (2 bytes) - 0.1°C resolution
-    - Pressure: uint16 BE (2 bytes) - 0.1 hPa resolution
-    - Humidity: uint8 (1 byte) - 1% resolution
-    - Battery: uint16 BE (2 bytes) - 1 mV resolution
-    - Solar: uint16 BE (2 bytes) - 1 mV resolution
-    - Voltage Slope: int16 BE (2 bytes) - 1 mV/h resolution
-    - Satellites: uint8 (1 byte)
-    - HDOP: uint8 (1 byte) - 0.1 resolution
-    - Power Mode: uint8 (1 byte)
-    - CRC16: uint16 BE (2 bytes)
-    
-    Args:
-        data_base64: base64 encoded payload string
-        
+    Decode Port 11: Core science archive, wire format v6 (packet_type 0x06).
+
+    Wire format per stratosonde/firmware Core/Src/payload_encode.c
+    (EncodeBulkPacketV6 + SerializeRecordV3LE) and docs/PayloadFormats.md
+    "PORT 11 ... v6" (STAB-04/#151). ALL multibyte fields are LITTLE-ENDIAN
+    (D9 - LE is wire truth; the previous decoder read big-endian with legacy
+    field offsets, which is why Port 11 pressure/temp/humidity came out as
+    garbage that did not agree with the Port 10 heartbeat).
+
+    Packet layout: total length 6 + 38*n
+      [0]     packet_type = 0x06
+      [1]     record_count n (1..5)
+      [2..]   n * 38-byte wire records = uint32 LE sequence + 34-byte record
+      [end-4] CRC32 (LE) over all preceding bytes
+
+    Each 34-byte record is little-endian; lat/lon use the sensor_t binary
+    scaling deg = raw * 90/8388607 (lat) and raw * 180/8388607 (lon) from
+    sys_sensors.c (NOT 1e-7 as an out-of-date doc note claimed).
+
     Returns:
-        dict with decoded bulk telemetry
+        dict with packet_type, record_count, crc32/crc32_valid and a
+        'records' list, or None if the payload is not a valid v6 packet.
     """
     import base64
-    
+
+    BULK_PACKET_TYPE_V6 = 0x06
+    BULK_V6_MAX_RECORDS = 5
+    RECORD_WIRE_LEN = 38   # 4-byte sequence + 34-byte record
+    GPS_SCALE = 8388607.0  # 2^23 - 1 (sensor_t binary <-> degrees, sys_sensors.c)
+    MODE_NAMES = {0: "NORMAL", 1: "CONSERVATIVE", 2: "REDUCED", 3: "RECOVERY", 4: "SURVIVAL"}
+
     try:
         payload = base64.b64decode(data_base64)
-    except:
+    except Exception:
         return None
-    
+
     if len(payload) < 6:
         print(f"Warning: Port 11 packet too short, got {len(payload)} bytes")
         return None
-    
-    idx = 0
+
     result = {}
-    
-    # Header (6 bytes)
-    result['packet_type'] = payload[idx]
-    idx += 1
-    result['record_count'] = payload[idx]
-    idx += 1
-    result['flash_address'] = int.from_bytes(payload[idx:idx+4], 'big')
-    idx += 4
-    
-    # Validate record count
-    if result['record_count'] > 6:
-        print(f"Warning: Invalid record count {result['record_count']}, expected max 6")
+    result['packet_type'] = payload[0]
+    result['record_count'] = payload[1]
+
+    if payload[0] != BULK_PACKET_TYPE_V6:
+        print(f"Warning: Port 11 packet_type 0x{payload[0]:02X} not supported "
+              f"(decoder expects v6 0x06)")
         return None
-    
-    # Decode records (32 bytes each)
+
+    n = payload[1]
+    if not (1 <= n <= BULK_V6_MAX_RECORDS):
+        print(f"Warning: Invalid v6 record count {n}, expected 1..{BULK_V6_MAX_RECORDS}")
+        return None
+
+    expected_len = 6 + RECORD_WIRE_LEN * n
+    if len(payload) != expected_len:
+        print(f"Warning: Port 11 v6 length {len(payload)} != expected {expected_len} "
+              f"for {n} records")
+        return None
+
+    # Whole-packet CRC32 (LE) over everything except the trailing 4 bytes
+    wire_crc32 = int.from_bytes(payload[-4:], 'little')
+    calc_crc32 = _crc32_ieee(payload[:-4])
+    result['crc32'] = wire_crc32
+    result['crc32_valid'] = (calc_crc32 == wire_crc32)
+    if not result['crc32_valid']:
+        print(f"Warning: Port 11 v6 CRC32 mismatch "
+              f"(wire 0x{wire_crc32:08X}, calc 0x{calc_crc32:08X})")
+
     result['records'] = []
-    for i in range(result['record_count']):
-        if idx + 32 > len(payload):
-            print(f"Warning: Not enough data for record {i+1}")
-            break
-        
+    off = 2
+    for i in range(n):
+        seq = int.from_bytes(payload[off:off+4], 'little')
+        rec = payload[off+4:off+38]        # 34-byte record
+        off += RECORD_WIRE_LEN
+
         record = {}
-        
-        # Timestamp (4 bytes BE, second resolution)
-        record['timestamp_seconds'] = int.from_bytes(payload[idx:idx+4], 'big')
-        idx += 4
-        
-        # Latitude (4 bytes BE, signed, full precision)
-        # Scaling: divide by 10000000 to get degrees (~1cm resolution)
-        lat_raw = int.from_bytes(payload[idx:idx+4], 'big', signed=True)
-        idx += 4
-        record['latitude'] = lat_raw / 10000000.0
-        
-        # Longitude (4 bytes BE, signed, full precision)
-        # Scaling: divide by 10000000 to get degrees (~1cm resolution)
-        lon_raw = int.from_bytes(payload[idx:idx+4], 'big', signed=True)
-        idx += 4
-        record['longitude'] = lon_raw / 10000000.0
-        
-        # Altitude (2 bytes BE, signed, 1m resolution)
-        # Direct meters value, offset by -1000m (range: -1000m to +64535m)
-        alt_raw = int.from_bytes(payload[idx:idx+2], 'big', signed=True)
-        idx += 2
-        record['altitude'] = alt_raw + 1000
-        
-        # Temperature (2 bytes BE, signed, 0.1°C resolution)
-        # Scaling: divide by 10, offset by -50°C
-        temp_raw = int.from_bytes(payload[idx:idx+2], 'big', signed=True)
-        idx += 2
-        record['temperature'] = (temp_raw / 10.0) - 50
-        
-        # Pressure (2 bytes BE, unsigned, 0.1 hPa resolution)
-        # Scaling: divide by 10, offset by 300 hPa
-        pressure_raw = int.from_bytes(payload[idx:idx+2], 'big')
-        idx += 2
-        record['pressure'] = (pressure_raw / 10.0) + 300
-        
-        # Humidity (1 byte, unsigned, 1% resolution)
-        record['humidity'] = payload[idx]
-        idx += 1
-        
-        # Battery voltage (2 bytes BE, unsigned, 1 mV resolution)
-        battery_raw = int.from_bytes(payload[idx:idx+2], 'big')
-        idx += 2
-        record['battery_voltage'] = battery_raw / 1000.0  # Convert to volts
-        
-        # Solar voltage (2 bytes BE, unsigned, 1 mV resolution)
-        solar_raw = int.from_bytes(payload[idx:idx+2], 'big')
-        idx += 2
-        record['solar_voltage'] = solar_raw / 1000.0  # Convert to volts
-        
-        # Voltage slope (2 bytes BE, signed, 1 mV/h resolution)
-        voltage_slope_raw = int.from_bytes(payload[idx:idx+2], 'big', signed=True)
-        idx += 2
-        record['voltage_slope'] = voltage_slope_raw  # mV/h
-        
-        # Satellites (1 byte)
-        record['satellites'] = payload[idx]
-        idx += 1
-        
-        # HDOP (1 byte, 0.1 resolution)
-        hdop_raw = payload[idx]
-        idx += 1
-        record['hdop'] = hdop_raw / 10.0
-        
-        # Power mode (1 byte)
-        # 0=NORMAL, 1=CONSERVATIVE, 2=REDUCED, 3=RECOVERY, 4=SURVIVAL
-        record['power_mode'] = payload[idx]
-        mode_names = {0: "NORMAL", 1: "CONSERVATIVE", 2: "REDUCED", 3: "RECOVERY", 4: "SURVIVAL"}
-        record['power_mode_name'] = mode_names.get(record['power_mode'], f"UNKNOWN({record['power_mode']})")
-        idx += 1
-        
-        # CRC16 (2 bytes BE)
-        record['crc16'] = int.from_bytes(payload[idx:idx+2], 'big')
-        idx += 2
-        
+        record['sequence'] = seq
+        record['timestamp_seconds'] = int.from_bytes(rec[0:4], 'little')
+        lat_raw = int.from_bytes(rec[4:8], 'little', signed=True)
+        lon_raw = int.from_bytes(rec[8:12], 'little', signed=True)
+        record['latitude'] = lat_raw * 90.0 / GPS_SCALE
+        record['longitude'] = lon_raw * 180.0 / GPS_SCALE
+        record['altitude'] = int.from_bytes(rec[12:14], 'little')                # metres
+        record['temperature'] = int.from_bytes(rec[14:16], 'little', signed=True) / 10.0
+        record['humidity'] = int.from_bytes(rec[16:18], 'little') / 10.0
+        record['pressure'] = int.from_bytes(rec[18:20], 'little') / 10.0
+        record['battery_voltage'] = int.from_bytes(rec[20:22], 'little') / 1000.0
+        record['solar_voltage'] = int.from_bytes(rec[22:24], 'little') / 1000.0
+        record['voltage_slope'] = int.from_bytes(rec[24:26], 'little', signed=True)  # mV/h
+        record['satellites'] = rec[26]
+        record['hdop'] = rec[27] / 10.0
+        record['power_mode'] = rec[28]
+        record['power_mode_name'] = MODE_NAMES.get(rec[28], f"UNKNOWN({rec[28]})")
+        flags = rec[29]
+        record['flags'] = flags
+        record['gps_fix_valid'] = bool(flags & 0x01)
+        sq = rec[30]
+        record['sensor_quality'] = sq
+        record['press_stale'] = bool(sq & 0x01)
+        record['temp_stale'] = bool(sq & 0x02)
+        record['hum_stale'] = bool(sq & 0x04)
+        record['gnss_stale'] = bool(sq & 0x08)
+        record['batt_stale'] = bool(sq & 0x10)
+        record['veto_reason'] = rec[31]
+
+        # Per-record CRC16 (LE) over record bytes 0-31
+        rec_crc = int.from_bytes(rec[32:34], 'little')
+        record['crc16'] = rec_crc
+        record['crc16_valid'] = (_crc16_modbus(rec[0:32]) == rec_crc)
+
         result['records'].append(record)
-    
-    # Metadata (24 bytes) - if present
-    if idx + 24 <= len(payload):
-        result['metadata'] = {}
-        
-        # Voltage trend data (12 bytes) - placeholder for future use
-        result['metadata']['voltage_trend_data'] = payload[idx:idx+12].hex()
-        idx += 12
-        
-        # Mode history (8 bytes) - placeholder for future use
-        result['metadata']['mode_history'] = payload[idx:idx+8].hex()
-        idx += 8
-        
-        # CRC32 (4 bytes BE)
-        result['metadata']['crc32'] = int.from_bytes(payload[idx:idx+4], 'big')
-        idx += 4
-    
+
     return result
 
 
@@ -774,10 +753,10 @@ async def chirpstack_webhook(request: Request):
             if data_base64:
                 port11_data = decode_port11_bulk(data_base64)
                 if port11_data:
-                    print("\n--- PORT 11 BULK PACKET ---")
-                    print(f"Packet Type: {port11_data['packet_type']}")
+                    print("\n--- PORT 11 BULK PACKET v6 ---")
+                    print(f"Packet Type: 0x{port11_data['packet_type']:02X}")
                     print(f"Record Count: {port11_data['record_count']}")
-                    print(f"Flash Address: 0x{port11_data['flash_address']:08X}")
+                    print(f"Packet CRC32 valid: {port11_data['crc32_valid']}")
                     print(f"\nRecords:")
                     
                     # Process each record in the bulk packet
@@ -798,7 +777,7 @@ async def chirpstack_webhook(request: Request):
                         print(f"    Satellites: {record['satellites']}")
                         print(f"    HDOP: {record['hdop']:.1f}")
                         print(f"    Power Mode: {record['power_mode_name']}")
-                        print(f"    CRC16: 0x{record['crc16']:04X}")
+                        print(f"    Sequence: {record['sequence']} | CRC16 valid: {record['crc16_valid']}")
                         
                         # Create individual telemetry point for each record
                         record_point = {
@@ -819,9 +798,12 @@ async def chirpstack_webhook(request: Request):
                             "satellites": record['satellites'],
                             "battery_voltage": record['battery_voltage'],
                             "solar_panel_voltage": record['solar_voltage'],
-                            "voltage_slope": record['voltage_slope'] / 10.0,  # Convert to consistent format (÷10)
+                            "voltage_slope": record['voltage_slope'],  # mV/h (v6 wire units)
                             "operating_mode": record['power_mode'],
                             "hdop": record['hdop'],
+                            "sensor_quality": record['sensor_quality'],
+                            "veto_reason": record['veto_reason'],
+                            "crc16_valid": record['crc16_valid'],
                             "rssi": best_gateway.get("rssi", None),
                             "snr": best_gateway.get("snr", None),
                             "fcnt": payload.get("fCnt", None),
@@ -835,19 +817,12 @@ async def chirpstack_webhook(request: Request):
                             "code_rate": code_rate,
                             "gateways": gateways,
                             "bulk_record_index": idx,
-                            "bulk_flash_address": port11_data['flash_address'],
+                            "bulk_sequence": record['sequence'],
                             "crc16": record['crc16']
                         }
                         
                         telemetry_data.append(record_point)
                         records_added += 1
-                    
-                    # Add metadata if present
-                    if 'metadata' in port11_data:
-                        print(f"\n  Metadata:")
-                        print(f"    Voltage Trend: {port11_data['metadata']['voltage_trend_data']}")
-                        print(f"    Mode History: {port11_data['metadata']['mode_history']}")
-                        print(f"    CRC32: 0x{port11_data['metadata']['crc32']:08X}")
                     
                     print("---------------------------\n")
                     
