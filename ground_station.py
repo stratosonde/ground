@@ -6,6 +6,13 @@ import json
 import os
 from pathlib import Path
 
+# Wire decoders GENERATED from the firmware single-source-of-truth schema
+# (stratosonde/firmware wire/wire_schema.json -> wire_decode_gen.py). Do not
+# hand-edit the import target; the layout lives in the firmware repo and this
+# vendored copy is refreshed from it. The decode_* functions return raw physical
+# values; the wrappers below map them onto the ground-station API field names.
+import wire_decode_gen as _wire
+
 app = FastAPI(title="Stratosonde Ground Station")
 
 # Base directory of this script (so paths work regardless of CWD / under systemd)
@@ -245,51 +252,42 @@ def decode_port10_compact(data_base64):
         print(f"Warning: Port 10 heartbeat v2 should be 11 bytes, got {len(payload)}")
         return None
 
+    # Raw physical decode from the firmware-schema-generated decoder.
+    d = _wire.decode_heartbeat(data_base64)
+    if d is None:
+        return None
+
     result = {}
 
     # Timestamp (uint16 LE, minutes since epoch)
-    timestamp_minutes = int.from_bytes(payload[0:2], 'little')
-    result['timestamp_minutes'] = timestamp_minutes
-    result['decoded_time'] = f"{timestamp_minutes} minutes since epoch"
+    result['timestamp_minutes'] = d['timestamp_min']
+    result['decoded_time'] = f"{d['timestamp_min']} minutes since epoch"
 
-    # Latitude (int16 LE, full-range scale: deg = value * 90 / 32767)
-    lat_raw = int.from_bytes(payload[2:4], 'little', signed=True)
-    result['latitude'] = lat_raw * 90.0 / 32767.0
+    # Latitude / Longitude (already scaled to degrees by the generated decoder)
+    result['latitude'] = d['latitude_raw']
+    result['longitude'] = d['longitude_raw']
 
-    # Longitude (int16 LE, full-range scale: deg = value * 180 / 32767)
-    lon_raw = int.from_bytes(payload[4:6], 'little', signed=True)
-    result['longitude'] = lon_raw * 180.0 / 32767.0
+    # Temperature (degC)
+    result['temperature'] = d['temperature_raw']
 
-    # Temperature (uint8, degC = (value - 64) * 2)
-    temp_raw = payload[6]
-    result['temperature'] = (temp_raw - 64) * 2
+    # Pressure + Humidity (generated decoder applies the sentinel -> None already)
+    result['pressure'] = d['pressure_raw']            # 1 hPa units
+    result['humidity'] = (min(d['humidity_raw'], 100)
+                          if d['humidity_raw'] is not None else None)
 
-    # Packed Pressure + Humidity (uint16 LE)
-    press_hum = int.from_bytes(payload[7:9], 'little')
-    pressure_raw = press_hum & PRESS_HUM_PRESS_MASK
-    humidity_raw = (press_hum >> 11) & 0x1F
-    if pressure_raw == PRESS_HUM_PRESS_INVALID:
-        result['pressure'] = None
-    else:
-        result['pressure'] = pressure_raw            # 1 hPa units, 0-2046 hPa
-    if humidity_raw == PRESS_HUM_HUM_INVALID:
-        result['humidity'] = None
-    else:
-        result['humidity'] = min(humidity_raw * 5, 100)   # 5%%-units -> %%
-
-    # Battery (uint8, volts = value * 0.050)
-    result['battery_voltage'] = payload[9] * 0.050
+    # Battery (volts)
+    result['battery_voltage'] = d['battery_raw']
 
     # Status byte v2 (byte 10)
     status = payload[10]
     result['status_byte'] = status
-    result['gps_stale'] = bool(status & STATUS_GPS_STALE_MASK)
-    result['temp_stale'] = bool(status & STATUS_TEMP_STALE_MASK)
-    result['humidity_stale'] = bool(status & STATUS_HUM_STALE_MASK)
-    result['pressure_stale'] = bool(status & STATUS_PRESS_STALE_MASK)
-    result['time_gnss_disciplined'] = bool(status & STATUS_TIME_GNSS_MASK)
-    result['timestamp_wrapped'] = bool(status & STATUS_TS_WRAP_MASK)
-    mission_state = (status & STATUS_MISSION_STATE_MASK) >> 6
+    result['gps_stale'] = d['gps_stale']
+    result['temp_stale'] = d['temp_stale']
+    result['humidity_stale'] = d['humidity_stale']
+    result['pressure_stale'] = d['pressure_stale']
+    result['time_gnss_disciplined'] = d['time_gnss_disciplined']
+    result['timestamp_wrapped'] = d['timestamp_wrapped']
+    mission_state = d['mission_state']
     result['mission_state'] = mission_state
     result['mission_state_name'] = MISSION_STATES.get(mission_state, "UNKNOWN")
 
@@ -350,28 +348,24 @@ def decode_port20_version(data_base64):
         print(f"Warning: Port 20 bad magic byte 0x{payload[0]:02X} (expected 0x56)")
         return None
 
+    # Raw physical decode from the firmware-schema-generated decoder (includes CRC check).
+    d = _wire.decode_version_report(data_base64)
+    if d is None:
+        return None
+
     result = {}
-    result['magic'] = payload[0]
-    result['fw_major'] = payload[1]
-    result['fw_minor'] = payload[2]
-    result['fw_patch'] = payload[3]
-    result['firmware_version'] = f"{payload[1]}.{payload[2]}.{payload[3]}"
-    result['format_version'] = payload[4]
-    stage_raw = payload[5]
+    result['magic'] = d['magic']
+    result['fw_major'] = d['fw_major']
+    result['fw_minor'] = d['fw_minor']
+    result['fw_patch'] = d['fw_patch']
+    result['firmware_version'] = f"{d['fw_major']}.{d['fw_minor']}.{d['fw_patch']}"
+    result['format_version'] = d['heartbeat_format_version']
+    stage_raw = d['stage']
     result['stage'] = stage_raw
     result['stage_name'] = STAGES.get(stage_raw, f"UNKNOWN(0x{stage_raw:02X})")
-    result['mission_minutes'] = int.from_bytes(payload[6:10], 'little')
-
-    # CRC-16/CCITT-FALSE (poly 0x1021, init 0xFFFF, no reflect, no xorout)
-    # over bytes 0-9, compared against the LE word in bytes 10-11.
-    crc = 0xFFFF
-    for b in payload[0:10]:
-        crc ^= (b << 8)
-        for _ in range(8):
-            crc = ((crc << 1) ^ 0x1021) & 0xFFFF if (crc & 0x8000) else (crc << 1) & 0xFFFF
-    wire_crc = int.from_bytes(payload[10:12], 'little')
-    result['crc16'] = wire_crc
-    result['crc_valid'] = (crc == wire_crc)
+    result['mission_minutes'] = d['mission_minutes']
+    result['crc16'] = d['crc16']
+    result['crc_valid'] = d['crc_valid']
 
     return result
 
@@ -428,7 +422,6 @@ def decode_port11_bulk(data_base64):
     BULK_PACKET_TYPE_V6 = 0x06
     BULK_V6_MAX_RECORDS = 5
     RECORD_WIRE_LEN = 38   # 4-byte sequence + 34-byte record
-    GPS_SCALE = 8388607.0  # 2^23 - 1 (sensor_t binary <-> degrees, sys_sensors.c)
     MODE_NAMES = {0: "NORMAL", 1: "CONSERVATIVE", 2: "REDUCED", 3: "RECOVERY", 4: "SURVIVAL"}
 
     try:
@@ -439,10 +432,6 @@ def decode_port11_bulk(data_base64):
     if len(payload) < 6:
         print(f"Warning: Port 11 packet too short, got {len(payload)} bytes")
         return None
-
-    result = {}
-    result['packet_type'] = payload[0]
-    result['record_count'] = payload[1]
 
     if payload[0] != BULK_PACKET_TYPE_V6:
         print(f"Warning: Port 11 packet_type 0x{payload[0]:02X} not supported "
@@ -460,57 +449,51 @@ def decode_port11_bulk(data_base64):
               f"for {n} records")
         return None
 
-    # Whole-packet CRC32 (LE) over everything except the trailing 4 bytes
-    wire_crc32 = int.from_bytes(payload[-4:], 'little')
-    calc_crc32 = _crc32_ieee(payload[:-4])
-    result['crc32'] = wire_crc32
-    result['crc32_valid'] = (calc_crc32 == wire_crc32)
+    # Raw physical decode from the firmware-schema-generated decoder (envelope CRC32
+    # + per-record CRC16 validated inside).
+    d = _wire.decode_bulk_packet_v6(data_base64)
+    if d is None:
+        return None
+
+    result = {}
+    result['packet_type'] = d['packet_type']
+    result['record_count'] = n
+    result['crc32'] = int.from_bytes(payload[-4:], 'little')
+    result['crc32_valid'] = d['crc32_valid']
     if not result['crc32_valid']:
-        print(f"Warning: Port 11 v6 CRC32 mismatch "
-              f"(wire 0x{wire_crc32:08X}, calc 0x{calc_crc32:08X})")
+        print("Warning: Port 11 v6 CRC32 mismatch")
 
     result['records'] = []
-    off = 2
-    for i in range(n):
-        seq = int.from_bytes(payload[off:off+4], 'little')
-        rec = payload[off+4:off+38]        # 34-byte record
-        off += RECORD_WIRE_LEN
-
+    for rec in d['records']:
         record = {}
-        record['sequence'] = seq
-        record['timestamp_seconds'] = int.from_bytes(rec[0:4], 'little')
-        lat_raw = int.from_bytes(rec[4:8], 'little', signed=True)
-        lon_raw = int.from_bytes(rec[8:12], 'little', signed=True)
-        record['latitude'] = lat_raw * 90.0 / GPS_SCALE
-        record['longitude'] = lon_raw * 180.0 / GPS_SCALE
-        record['altitude'] = int.from_bytes(rec[12:14], 'little')                # metres
-        record['temperature'] = int.from_bytes(rec[14:16], 'little', signed=True) / 10.0
-        record['humidity'] = int.from_bytes(rec[16:18], 'little') / 10.0
-        record['pressure'] = int.from_bytes(rec[18:20], 'little') / 10.0
-        record['battery_voltage'] = int.from_bytes(rec[20:22], 'little') / 1000.0
-        record['solar_voltage'] = int.from_bytes(rec[22:24], 'little') / 1000.0
-        record['voltage_slope'] = int.from_bytes(rec[24:26], 'little', signed=True)  # mV/h
-        record['satellites'] = rec[26]
-        record['hdop'] = rec[27] / 10.0
-        record['power_mode'] = rec[28]
-        record['power_mode_name'] = MODE_NAMES.get(rec[28], f"UNKNOWN({rec[28]})")
-        flags = rec[29]
+        record['sequence'] = rec['sequence']
+        record['timestamp_seconds'] = rec['timestamp']
+        record['latitude'] = rec['latitude_deg']
+        record['longitude'] = rec['longitude_deg']
+        record['altitude'] = rec['altitude_m']                  # metres
+        record['temperature'] = rec['temperature_degC']
+        record['humidity'] = rec['humidity_pct']
+        record['pressure'] = rec['pressure_hPa']
+        record['battery_voltage'] = rec['battery_mV'] / 1000.0
+        record['solar_voltage'] = rec['solar_mV'] / 1000.0
+        record['voltage_slope'] = rec['voltage_slope_mVh']      # mV/h
+        record['satellites'] = rec['satellites']
+        record['hdop'] = rec['hdop']
+        record['power_mode'] = rec['power_mode']
+        record['power_mode_name'] = MODE_NAMES.get(rec['power_mode'], f"UNKNOWN({rec['power_mode']})")
+        flags = rec['flags']
         record['flags'] = flags
         record['gps_fix_valid'] = bool(flags & 0x01)
-        sq = rec[30]
+        sq = rec['sensor_quality']
         record['sensor_quality'] = sq
         record['press_stale'] = bool(sq & 0x01)
         record['temp_stale'] = bool(sq & 0x02)
         record['hum_stale'] = bool(sq & 0x04)
         record['gnss_stale'] = bool(sq & 0x08)
         record['batt_stale'] = bool(sq & 0x10)
-        record['veto_reason'] = rec[31]
-
-        # Per-record CRC16 (LE) over record bytes 0-31
-        rec_crc = int.from_bytes(rec[32:34], 'little')
-        record['crc16'] = rec_crc
-        record['crc16_valid'] = (_crc16_modbus(rec[0:32]) == rec_crc)
-
+        record['veto_reason'] = rec['veto_reason']
+        record['crc16'] = rec['crc16']
+        record['crc16_valid'] = rec['crc16_valid']
         result['records'].append(record)
 
     return result
