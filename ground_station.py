@@ -190,88 +190,117 @@ def decode_gnss_detail(data_base64):
 
 def decode_port10_compact(data_base64):
     """
-    Decode Port 10: Compact Binary Packet (10 bytes)
-    
-    Ultra-compact telemetry optimized for SF10 (maximum range):
-    - Timestamp: uint16 BE (2 bytes) - 1 minute resolution
-    - Latitude: int16 BE (2 bytes) - ~100m resolution
-    - Longitude: int16 BE (2 bytes) - ~100m resolution
-    - Temperature: int8 (1 byte) - 2°C resolution
-    - Pressure: uint8 (1 byte) - 10 hPa resolution
-    - Battery: uint8 (1 byte) - 50 mV resolution
-    - Humidity: uint8 (1 byte) - 5% resolution
-    
+    Decode Port 10: Mission Heartbeat v2 (11 bytes, little-endian).
+
+    Wire format per stratosonde/firmware docs/PayloadFormats.md +
+    docs/LoRaWANApplicationProtocol.md (HEARTBEAT_FORMAT_VERSION 2, D2/D4, #33).
+    All multibyte fields are LITTLE-ENDIAN (D9 - LE is wire truth; earlier docs
+    that described big-endian were wrong).
+
+    Byte layout (11 bytes):
+      | Off | Field               | Type       | Scaling / meaning                 |
+      |-----|---------------------|------------|-----------------------------------|
+      | 0   | Timestamp (minutes) | uint16 LE  | minutes since epoch (wraps ~45.5d)|
+      | 2   | Latitude            | int16 LE   | deg = value * 90  / 32767         |
+      | 4   | Longitude           | int16 LE   | deg = value * 180 / 32767         |
+      | 6   | Temperature         | uint8      | degC = (value - 64) * 2           |
+      | 7   | Pressure+Humidity   | uint16 LE  | bits 0-10 pressure hPa (2047 inv);|
+      |     |                     |            | bits 11-15 humidity 5%% (31 inv)  |
+      | 9   | Battery             | uint8      | volts = value * 0.050             |
+      | 10  | Status v2           | uint8      | bit flags (see masks below)       |
+
+    v1 (legacy) shared port/length but is NOT decodable as v2 and never flew;
+    v1 vs v2 is discriminated by deployment epoch + golden vectors.
+
     Args:
         data_base64: base64 encoded payload string
-        
+
     Returns:
-        dict with decoded telemetry
+        dict with decoded telemetry, or None if the payload is not a valid
+        11-byte v2 heartbeat.
     """
     import base64
-    from datetime import datetime, timedelta
-    
+
+    # Packed pressure/humidity word (bytes 7-8, LE) sentinels
+    PRESS_HUM_PRESS_MASK = 0x07FF
+    PRESS_HUM_PRESS_INVALID = 0x07FF          # 2047 = invalid pressure
+    PRESS_HUM_HUM_INVALID = 31                # 31 (5%%-units) = invalid humidity
+
+    # Status byte (byte 10) v2 bit masks
+    STATUS_GPS_STALE_MASK = 0x01              # bit 0: GPS position last-known-good
+    STATUS_TEMP_STALE_MASK = 0x02             # bit 1: temperature last-known-good
+    STATUS_HUM_STALE_MASK = 0x04              # bit 2: humidity last-known-good
+    STATUS_PRESS_STALE_MASK = 0x08            # bit 3: pressure last-known-good
+    STATUS_TIME_GNSS_MASK = 0x10              # bit 4: RTC GNSS-disciplined this cycle
+    STATUS_TS_WRAP_MASK = 0x20                # bit 5: timestamp_min has wrapped
+    STATUS_MISSION_STATE_MASK = 0xC0          # bits 6-7: mission state
+    MISSION_STATES = {0: "COMMISSIONING", 1: "ASCENT", 2: "FLOAT", 3: "RESERVED"}
+
     try:
         payload = base64.b64decode(data_base64)
-    except:
+    except Exception:
         return None
-    
-    if len(payload) != 10:
-        print(f"Warning: Port 10 packet should be 10 bytes, got {len(payload)}")
+
+    if len(payload) != 11:
+        print(f"Warning: Port 10 heartbeat v2 should be 11 bytes, got {len(payload)}")
         return None
-    
-    idx = 0
+
     result = {}
-    
-    # Timestamp (2 bytes BE, 1 minute resolution)
-    timestamp_minutes = int.from_bytes(payload[idx:idx+2], 'big')
-    idx += 2
-    # Convert to Unix timestamp (assuming epoch start)
-    # Device should send minutes since a known epoch
+
+    # Timestamp (uint16 LE, minutes since epoch)
+    timestamp_minutes = int.from_bytes(payload[0:2], 'little')
     result['timestamp_minutes'] = timestamp_minutes
     result['decoded_time'] = f"{timestamp_minutes} minutes since epoch"
-    
-    # Latitude (2 bytes BE, signed, ~100m resolution)
-    # Scaling: divide by 1000 to get degrees (range: -32.768 to +32.767 degrees)
-    lat_raw = int.from_bytes(payload[idx:idx+2], 'big', signed=True)
-    idx += 2
-    result['latitude'] = lat_raw / 1000.0
-    
-    # Longitude (2 bytes BE, signed, ~100m resolution)
-    # Scaling: divide by 1000 to get degrees (range: -32.768 to +32.767 degrees)
-    lon_raw = int.from_bytes(payload[idx:idx+2], 'big', signed=True)
-    idx += 2
-    result['longitude'] = lon_raw / 1000.0
-    
-    # Temperature (1 byte, signed, 2°C resolution)
-    # Scaling: multiply by 2, offset by -50°C (range: -50°C to +460°C)
-    temp_raw = int.from_bytes(payload[idx:idx+1], 'big', signed=True)
-    idx += 1
-    result['temperature'] = (temp_raw * 2) - 50
-    
-    # Pressure (1 byte, unsigned, 10 hPa resolution)
-    # Scaling: multiply by 10, offset by 300 hPa (range: 300 to 2850 hPa)
-    pressure_raw = payload[idx]
-    idx += 1
-    result['pressure'] = (pressure_raw * 10) + 300
-    
-    # Battery (1 byte, unsigned, 50 mV resolution)
-    # Scaling: multiply by 0.05 to get volts (range: 0V to 12.75V)
-    battery_raw = payload[idx]
-    idx += 1
-    result['battery_voltage'] = battery_raw * 0.05
-    
-    # Humidity (1 byte, unsigned, 5% resolution)
-    # Scaling: multiply by 5 (range: 0% to 100%)
-    humidity_raw = payload[idx]
-    idx += 1
-    result['humidity'] = min(humidity_raw * 5, 100)  # Cap at 100%
-    
-    # Calculate altitude from pressure and temperature (barometric formula)
-    # Standard atmosphere: h = 44330 * (1 - (P/P0)^0.1903)
-    # Using temperature correction for better accuracy
-    P0 = 1013.25  # Sea level standard pressure in hPa
-    result['altitude_calculated'] = 44330 * (1 - (result['pressure'] / P0) ** 0.1903)
-    
+
+    # Latitude (int16 LE, full-range scale: deg = value * 90 / 32767)
+    lat_raw = int.from_bytes(payload[2:4], 'little', signed=True)
+    result['latitude'] = lat_raw * 90.0 / 32767.0
+
+    # Longitude (int16 LE, full-range scale: deg = value * 180 / 32767)
+    lon_raw = int.from_bytes(payload[4:6], 'little', signed=True)
+    result['longitude'] = lon_raw * 180.0 / 32767.0
+
+    # Temperature (uint8, degC = (value - 64) * 2)
+    temp_raw = payload[6]
+    result['temperature'] = (temp_raw - 64) * 2
+
+    # Packed Pressure + Humidity (uint16 LE)
+    press_hum = int.from_bytes(payload[7:9], 'little')
+    pressure_raw = press_hum & PRESS_HUM_PRESS_MASK
+    humidity_raw = (press_hum >> 11) & 0x1F
+    if pressure_raw == PRESS_HUM_PRESS_INVALID:
+        result['pressure'] = None
+    else:
+        result['pressure'] = pressure_raw            # 1 hPa units, 0-2046 hPa
+    if humidity_raw == PRESS_HUM_HUM_INVALID:
+        result['humidity'] = None
+    else:
+        result['humidity'] = min(humidity_raw * 5, 100)   # 5%%-units -> %%
+
+    # Battery (uint8, volts = value * 0.050)
+    result['battery_voltage'] = payload[9] * 0.050
+
+    # Status byte v2 (byte 10)
+    status = payload[10]
+    result['status_byte'] = status
+    result['gps_stale'] = bool(status & STATUS_GPS_STALE_MASK)
+    result['temp_stale'] = bool(status & STATUS_TEMP_STALE_MASK)
+    result['humidity_stale'] = bool(status & STATUS_HUM_STALE_MASK)
+    result['pressure_stale'] = bool(status & STATUS_PRESS_STALE_MASK)
+    result['time_gnss_disciplined'] = bool(status & STATUS_TIME_GNSS_MASK)
+    result['timestamp_wrapped'] = bool(status & STATUS_TS_WRAP_MASK)
+    mission_state = (status & STATUS_MISSION_STATE_MASK) >> 6
+    result['mission_state'] = mission_state
+    result['mission_state_name'] = MISSION_STATES.get(mission_state, "UNKNOWN")
+
+    # Altitude is NOT transmitted - calculate from pressure + temperature
+    # using the barometric formula: h = 44330 * (1 - (P/P0)^0.1903)
+    if result['pressure']:
+        P0 = 1013.25  # Sea level standard pressure in hPa
+        result['altitude_calculated'] = 44330 * (1 - (result['pressure'] / P0) ** 0.1903)
+    else:
+        result['altitude_calculated'] = None
+
     return result
 
 
@@ -590,14 +619,21 @@ async def chirpstack_webhook(request: Request):
             if data_base64:
                 port10_data = decode_port10_compact(data_base64)
                 if port10_data:
-                    print("\n--- PORT 10 COMPACT PACKET ---")
+                    alt = port10_data['altitude_calculated']
+                    press = port10_data['pressure']
+                    hum = port10_data['humidity']
+                    print("\n--- PORT 10 HEARTBEAT v2 ---")
                     print(f"Timestamp: {port10_data['decoded_time']} ({port10_data['timestamp_minutes']} min)")
                     print(f"Location: {port10_data['latitude']:.4f}°, {port10_data['longitude']:.4f}°")
-                    print(f"Altitude (calculated): {port10_data['altitude_calculated']:.1f}m")
+                    print(f"Altitude (calculated): {alt:.1f}m" if alt is not None else "Altitude (calculated): N/A (pressure invalid)")
                     print(f"Temperature: {port10_data['temperature']}°C")
-                    print(f"Pressure: {port10_data['pressure']} hPa")
-                    print(f"Humidity: {port10_data['humidity']}%")
+                    print(f"Pressure: {press} hPa" if press is not None else "Pressure: N/A (invalid sentinel)")
+                    print(f"Humidity: {hum}%" if hum is not None else "Humidity: N/A (invalid sentinel)")
                     print(f"Battery: {port10_data['battery_voltage']:.2f}V")
+                    print(f"Mission state: {port10_data['mission_state_name']} | "
+                          f"time GNSS-disciplined: {port10_data['time_gnss_disciplined']} | "
+                          f"stale(gps/t/h/p): {port10_data['gps_stale']}/{port10_data['temp_stale']}/"
+                          f"{port10_data['humidity_stale']}/{port10_data['pressure_stale']}")
                     print("-------------------------------\n")
                     
                     # Override extracted values with decoded binary data
